@@ -119,21 +119,30 @@ pub fn checksum(bytes: &[u8]) -> [u8; 2] {
 }
 
 /// A full frame from `blocks` of `(data_id, data)`, the inverse of [`Decoder`] (for tests and simulators).
+///
+/// # Panics
+/// When the blocks do not fit one frame (a payload over 255 bytes); [`try_encode_frame`] returns `None` instead.
+#[allow(clippy::expect_used)]
 pub fn encode_frame(tid: u16, blocks: &[(u8, &[u8])]) -> Vec<u8> {
+    try_encode_frame(tid, blocks).expect("payload over 255 bytes")
+}
+
+/// [`encode_frame`], or `None` when the blocks do not fit one frame (a payload over 255 bytes).
+pub fn try_encode_frame(tid: u16, blocks: &[(u8, &[u8])]) -> Option<Vec<u8>> {
     let mut payload = Vec::new();
     for (id, data) in blocks {
         payload.push(*id);
-        payload.push(data.len() as u8);
+        payload.push(u8::try_from(data.len()).ok()?);
         payload.extend_from_slice(data);
     }
-    assert!(payload.len() <= u8::MAX as usize, "payload over 255 bytes");
+    let payload_len = u8::try_from(payload.len()).ok()?;
     let mut frame = HEADER.to_vec();
     frame.extend_from_slice(&tid.to_le_bytes());
-    frame.push(payload.len() as u8);
+    frame.push(payload_len);
     frame.extend_from_slice(&payload);
-    let crc = checksum(&frame[2..]);
+    let crc = checksum(frame.get(2..).unwrap_or_default());
     frame.extend_from_slice(&crc);
-    frame
+    Some(frame)
 }
 
 /// Tunables for [`Decoder`].
@@ -223,24 +232,24 @@ impl Decoder {
                 }
             };
             self.skip(start);
-            if self.buffer.len() < PREFIX_LEN {
+            let &payload_len = self.buffer.get(PREFIX_LEN - 1)?;
+            let payload_end = PREFIX_LEN + usize::from(payload_len);
+            let frame_len = payload_end + 2;
+            let (Some(covered), Some(received_crc)) =
+                (self.buffer.get(2..payload_end), self.buffer.get(payload_end..frame_len))
+            else {
                 return None;
-            }
-            let payload_len = self.buffer[4] as usize;
-            let frame_len = payload_len + MIN_FRAME_LEN;
-            if self.buffer.len() < frame_len {
-                return None;
-            }
-            let crc = checksum(&self.buffer[2..PREFIX_LEN + payload_len]);
-            if crc != self.buffer[PREFIX_LEN + payload_len..frame_len] {
+            };
+            if checksum(covered) != received_crc {
                 // a false header or a corrupt frame: step past this 0x59 and hunt again
                 self.stats.checksum_errors += 1;
                 self.skip(1);
                 continue;
             }
-            let tid = u16::from_le_bytes([self.buffer[2], self.buffer[3]]);
-            let (frame, unknown_blocks, malformed) =
-                parse_payload(tid, &self.buffer[PREFIX_LEN..PREFIX_LEN + payload_len]);
+            let &[tid_low, tid_high, _len, ref payload @ ..] = covered else {
+                return None;
+            };
+            let (frame, unknown_blocks, malformed) = parse_payload(u16::from_le_bytes([tid_low, tid_high]), payload);
             self.stats.unknown_blocks += unknown_blocks;
             self.stats.malformed_payloads += u64::from(malformed);
             self.buffer.drain(..frame_len);
@@ -267,71 +276,81 @@ fn parse_payload(tid: u16, payload: &[u8]) -> (Frame, u64, bool) {
         let Some(&[id, len]) = payload.get(at..at + 2) else {
             return (frame, unknown_blocks, true);
         };
-        let Some(data) = payload.get(at + 2..at + 2 + len as usize) else {
+        let data_end = at + 2 + usize::from(len);
+        let Some(data) = payload.get(at + 2..data_end) else {
             return (frame, unknown_blocks, true);
         };
         // the SDK steps one byte past a block it cannot parse; the checksum already passed, so skip by its length
         if !parse_block(id, data, &mut frame) {
             unknown_blocks += 1;
         }
-        at += 2 + len as usize;
+        at = data_end;
     }
     (frame, unknown_blocks, false)
 }
 
-fn i16_at(data: &[u8], at: usize) -> i16 {
-    i16::from_le_bytes([data[at], data[at + 1]])
+fn le_bytes<const N: usize>(data: &[u8], at: usize) -> Option<[u8; N]> {
+    data.get(at..at.checked_add(N)?)?.try_into().ok()
 }
 
-fn i32_at(data: &[u8], at: usize) -> i32 {
-    i32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+fn i16_at(data: &[u8], at: usize) -> Option<i16> {
+    le_bytes(data, at).map(i16::from_le_bytes)
 }
 
-fn u32_at(data: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+fn i32_at(data: &[u8], at: usize) -> Option<i32> {
+    le_bytes(data, at).map(i32::from_le_bytes)
 }
 
-fn i64_at(data: &[u8], at: usize) -> i64 {
-    i64::from_le_bytes(data[at..at + 8].try_into().unwrap())
+fn u32_at(data: &[u8], at: usize) -> Option<u32> {
+    le_bytes(data, at).map(u32::from_le_bytes)
 }
 
-fn scaled3(data: &[u8], factor: f64) -> [f64; 3] {
-    [0, 1, 2].map(|axis| i32_at(data, axis * 4) as f64 * factor)
+fn i64_at(data: &[u8], at: usize) -> Option<i64> {
+    le_bytes(data, at).map(i64::from_le_bytes)
+}
+
+fn scaled<const N: usize>(data: &[u8], factor: f64) -> Option<[f64; N]> {
+    let mut values = [0.0; N];
+    for (axis, value) in values.iter_mut().enumerate() {
+        *value = f64::from(i32_at(data, axis * 4)?) * factor;
+    }
+    Some(values)
 }
 
 /// Fill `frame` from one block; false when the id is unknown or the length does not match it.
 fn parse_block(id: u8, data: &[u8], frame: &mut Frame) -> bool {
-    let len = data.len();
-    match (id, len) {
-        (SENSOR_TEMP_ID, 2) => frame.temperature_c = Some(i16_at(data, 0) as f64 * SENSOR_TEMP_FACTOR),
-        (ACCEL_ID, 12) => frame.accel_mps2 = Some(scaled3(data, ACC_FACTOR)),
-        (GYRO_ID, 12) => frame.gyro_rad_s = Some(scaled3(data, GYRO_FACTOR).map(f64::to_radians)),
-        (MAGNETIC_NORM_ID, 12) => frame.mag_norm = Some(scaled3(data, MAG_NORM_FACTOR)),
-        (RAW_MAGNETIC_ID, 12) => frame.mag_raw_mgauss = Some(scaled3(data, MAG_RAW_FACTOR)),
+    parse_known_block(id, data, frame).is_some()
+}
+
+fn parse_known_block(id: u8, data: &[u8], frame: &mut Frame) -> Option<()> {
+    match (id, data.len()) {
+        (SENSOR_TEMP_ID, 2) => frame.temperature_c = Some(f64::from(i16_at(data, 0)?) * SENSOR_TEMP_FACTOR),
+        (ACCEL_ID, 12) => frame.accel_mps2 = Some(scaled(data, ACC_FACTOR)?),
+        (GYRO_ID, 12) => frame.gyro_rad_s = Some(scaled::<3>(data, GYRO_FACTOR)?.map(f64::to_radians)),
+        (MAGNETIC_NORM_ID, 12) => frame.mag_norm = Some(scaled(data, MAG_NORM_FACTOR)?),
+        (RAW_MAGNETIC_ID, 12) => frame.mag_raw_mgauss = Some(scaled(data, MAG_RAW_FACTOR)?),
         (EULER_ID, 12) => {
             // the device sends pitch, roll, yaw
-            let [pitch, roll, yaw] = scaled3(data, EULER_FACTOR).map(f64::to_radians);
+            let [pitch, roll, yaw] = scaled::<3>(data, EULER_FACTOR)?.map(f64::to_radians);
             frame.euler = Some(Euler { roll, pitch, yaw });
         }
-        (QUATERNION_ID, 16) => {
-            frame.quaternion = Some([0, 1, 2, 3].map(|i| i32_at(data, i * 4) as f64 * QUATERNION_FACTOR))
-        }
-        (UTC_ID, 11) => frame.utc_raw = Some(data.try_into().unwrap()),
-        (SAMPLE_TIMESTAMP_ID, 4) => frame.sample_timestamp = Some(u32_at(data, 0)),
-        (DATA_READY_TIMESTAMP_ID, 4) => frame.data_ready_timestamp = Some(u32_at(data, 0)),
+        (QUATERNION_ID, 16) => frame.quaternion = Some(scaled(data, QUATERNION_FACTOR)?),
+        (UTC_ID, 11) => frame.utc_raw = Some(le_bytes(data, 0)?),
+        (SAMPLE_TIMESTAMP_ID, 4) => frame.sample_timestamp = Some(u32_at(data, 0)?),
+        (DATA_READY_TIMESTAMP_ID, 4) => frame.data_ready_timestamp = Some(u32_at(data, 0)?),
         (LOCATION_ID, 20) => {
             frame.position = Some(Position {
-                latitude_deg: i64_at(data, 0) as f64 * LAT_LON_FACTOR,
-                longitude_deg: i64_at(data, 8) as f64 * LAT_LON_FACTOR,
-                altitude_m: i32_at(data, 16) as f64 * ALT_FACTOR,
+                latitude_deg: i64_at(data, 0)? as f64 * LAT_LON_FACTOR,
+                longitude_deg: i64_at(data, 8)? as f64 * LAT_LON_FACTOR,
+                altitude_m: f64::from(i32_at(data, 16)?) * ALT_FACTOR,
             })
         }
         (SPEED_ID, 12) => {
-            let [east, north, up] = scaled3(data, VEL_FACTOR);
+            let [east, north, up] = scaled(data, VEL_FACTOR)?;
             frame.velocity = Some(Velocity { east, north, up });
         }
-        (STATUS_ID, 1) => frame.nav_status = Some(data[0]),
-        _ => return false,
+        (STATUS_ID, 1) => frame.nav_status = Some(*data.first()?),
+        _ => return None,
     }
-    true
+    Some(())
 }

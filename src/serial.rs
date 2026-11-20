@@ -76,22 +76,15 @@ impl Imu {
 
     /// One read(2) into the internal chunk.
     fn read_raw(&mut self) -> io::Result<usize> {
-        loop {
-            match self.file.read(&mut self.chunk) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "serial device closed")),
-                Ok(count) => {
-                    self.last_read_time = SystemTime::now();
-                    return Ok(count);
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        let count = read_retrying(&mut self.file, &mut self.chunk)?;
+        self.last_read_time = SystemTime::now();
+        Ok(count)
     }
 
-    /// Raw bytes straight off the device, bypassing the decoder (for recording fixtures).
+    /// Raw bytes straight off the device, bypassing the decoder (for recording fixtures); like
+    /// [`next_sample`](Imu::next_sample) it retries on EINTR and turns end-of-file (an unplugged device) into an error.
     pub fn read_into(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buffer)
+        read_retrying(&mut self.file, buffer)
     }
 
     pub fn stats(&self) -> DecoderStats {
@@ -104,6 +97,21 @@ impl Iterator for Imu {
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.next_sample())
+    }
+}
+
+/// One read(2), retried on EINTR; end-of-file (the device went away) is an `UnexpectedEof` error.
+fn read_retrying(source: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    if buffer.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        match source.read(buffer) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "serial device closed")),
+            Ok(count) => return Ok(count),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -126,6 +134,7 @@ fn configure_raw(file: &File, baud: u32) -> io::Result<()> {
         tio.c_cflag |= libc::CLOCAL | libc::CREAD;
         tio.c_cflag &= !(libc::CSTOPB | libc::PARENB | libc::CRTSCTS);
         tio.c_iflag &= !(libc::IXON | libc::IXOFF | libc::IXANY);
+        // block until a byte arrives, no inter-byte timer: reads wake on data, never on a timeout
         tio.c_cc[libc::VMIN] = 1;
         tio.c_cc[libc::VTIME] = 0;
         check(libc::cfsetispeed(&mut tio, speed))?;
@@ -165,4 +174,41 @@ fn speed_of(baud: u32) -> io::Result<libc::speed_t> {
 #[cfg(not(target_os = "linux"))]
 fn speed_of(baud: u32) -> io::Result<libc::speed_t> {
     Ok(baud as libc::speed_t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader that is interrupted once, then returns its bytes, then end-of-file.
+    struct Interrupted {
+        interrupted: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Read for Interrupted {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let count = self.bytes.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes.drain(..count);
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn reads_retry_on_eintr_and_end_of_file_is_an_error() {
+        let mut source = Interrupted {
+            interrupted: false,
+            bytes: vec![1, 2, 3],
+        };
+        let mut buffer = [0u8; 8];
+        assert_eq!(read_retrying(&mut source, &mut buffer).unwrap(), 3);
+        assert_eq!(&buffer[..3], &[1, 2, 3]);
+        let error = read_retrying(&mut source, &mut buffer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }

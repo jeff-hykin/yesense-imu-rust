@@ -213,3 +213,29 @@ fn euler_to_quaternion_matches_the_m20_vendor_driver() {
     // identity at zero
     assert_eq!(Euler::default().to_quaternion(), [1.0, 0.0, 0.0, 0.0]);
 }
+
+#[test]
+fn blocks_too_big_for_one_frame_are_refused_not_truncated() {
+    let big = vec![0u8; 256];
+    assert_eq!(yesense_imu::try_encode_frame(1, &[(ACCEL_ID, &big)]), None);
+    let fills = vec![0u8; 253];
+    assert_eq!(
+        yesense_imu::try_encode_frame(1, &[(ACCEL_ID, &fills)]).map(|frame| frame.len()),
+        Some(262)
+    );
+    let over = vec![0u8; 254];
+    assert_eq!(yesense_imu::try_encode_frame(1, &[(ACCEL_ID, &over)]), None);
+}
+
+#[test]
+fn a_max_length_frame_decodes_after_every_split() {
+    let bytes = yesense_imu::try_encode_frame(9, &[(0x7f, &[0u8; 253])]).unwrap();
+    for split in 0..bytes.len() {
+        let mut decoder = Decoder::default();
+        decoder.push(&bytes[..split]);
+        assert!(decoder.next_frame().is_none());
+        decoder.push(&bytes[split..]);
+        assert_eq!(decoder.next_frame().map(|frame| frame.tid), Some(9));
+        assert_eq!(decoder.stats().unknown_blocks, 1);
+    }
+}

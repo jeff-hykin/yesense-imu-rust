@@ -12,10 +12,14 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 pub mod protocol;
 #[cfg(unix)]
 pub mod serial;
 
-pub use protocol::{checksum, encode_frame, Decoder, DecoderConfig, DecoderStats, Euler, Frame, Position, Velocity};
+pub use protocol::{
+    checksum, encode_frame, try_encode_frame, Decoder, DecoderConfig, DecoderStats, Euler, Frame, Position, Velocity,
+};
 #[cfg(unix)]
 pub use serial::{Config, Imu, Sample};
