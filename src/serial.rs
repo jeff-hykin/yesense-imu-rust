@@ -15,6 +15,9 @@ pub struct Config {
     pub baud: u32,
     /// Bytes asked for per read(2); a read returns as soon as any bytes arrive.
     pub read_chunk_bytes: usize,
+    /// Read with this syscall number instead of read(2): the M20's vendor kernel delivers its IMU UART only through
+    /// one (aarch64 0x1cb on AOS); its tty path never sees the bytes.
+    pub read_syscall: Option<libc::c_long>,
     pub decoder: DecoderConfig,
 }
 
@@ -24,6 +27,7 @@ impl Config {
             path: path.into(),
             baud,
             read_chunk_bytes: 256,
+            read_syscall: None,
             decoder: DecoderConfig::default(),
         }
     }
@@ -41,6 +45,7 @@ pub struct Imu {
     file: File,
     decoder: Decoder,
     chunk: Vec<u8>,
+    read_syscall: Option<libc::c_long>,
     last_read_time: SystemTime,
 }
 
@@ -56,6 +61,7 @@ impl Imu {
             file,
             decoder: Decoder::new(config.decoder),
             chunk: vec![0; config.read_chunk_bytes.max(1)],
+            read_syscall: config.read_syscall,
             last_read_time: SystemTime::now(),
         })
     }
@@ -76,7 +82,10 @@ impl Imu {
 
     /// One read(2) into the internal chunk.
     fn read_raw(&mut self) -> io::Result<usize> {
-        let count = read_retrying(&mut self.file, &mut self.chunk)?;
+        let count = match self.read_syscall {
+            Some(number) => read_syscall_retrying(number, &self.file, &mut self.chunk)?,
+            None => read_retrying(&mut self.file, &mut self.chunk)?,
+        };
         self.last_read_time = SystemTime::now();
         Ok(count)
     }
@@ -84,7 +93,10 @@ impl Imu {
     /// Raw bytes straight off the device, bypassing the decoder (for recording fixtures); like
     /// [`next_sample`](Imu::next_sample) it retries on EINTR and turns end-of-file (an unplugged device) into an error.
     pub fn read_into(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        read_retrying(&mut self.file, buffer)
+        match self.read_syscall {
+            Some(number) => read_syscall_retrying(number, &self.file, buffer),
+            None => read_retrying(&mut self.file, buffer),
+        }
     }
 
     pub fn stats(&self) -> DecoderStats {
@@ -113,6 +125,37 @@ fn read_retrying(source: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize>
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Like [`read_retrying`], through a read-shaped syscall `(fd, buffer, length) -> count`.
+fn read_syscall_retrying(number: libc::c_long, file: &File, buffer: &mut [u8]) -> io::Result<usize> {
+    if buffer.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let result = raw_read_syscall(number, file, buffer)?;
+        match result {
+            0 => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "serial device closed")),
+            count if count > 0 => return Ok(usize::try_from(count).unwrap_or(0)),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn raw_read_syscall(number: libc::c_long, file: &File, buffer: &mut [u8]) -> io::Result<libc::c_long> {
+    // SAFETY: the kernel writes at most buffer.len() bytes into buffer, which outlives the call.
+    Ok(unsafe { libc::syscall(number, file.as_raw_fd(), buffer.as_mut_ptr(), buffer.len()) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn raw_read_syscall(_number: libc::c_long, _file: &File, _buffer: &mut [u8]) -> io::Result<libc::c_long> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "read_syscall is Linux-only"))
 }
 
 fn check(result: libc::c_int) -> io::Result<()> {
