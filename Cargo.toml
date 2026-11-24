@@ -1,6 +1,6 @@
 [package]
 name = "yesense-imu"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Driver for Yesense IMUs (YIS series) over a serial port: the standard binary output protocol decoded into accel, gyro, orientation, temperature and timestamps"
 license = "Apache-2.0"

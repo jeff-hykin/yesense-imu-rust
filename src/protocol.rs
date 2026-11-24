@@ -208,6 +208,11 @@ impl Decoder {
         self.buffer.len()
     }
 
+    /// Drop the bytes held (counts stay).
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
     pub fn push(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
         let limit = self.config.max_buffered_bytes.max(MIN_FRAME_LEN);

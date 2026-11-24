@@ -22,4 +22,4 @@ pub use protocol::{
     checksum, encode_frame, try_encode_frame, Decoder, DecoderConfig, DecoderStats, Euler, Frame, Position, Velocity,
 };
 #[cfg(unix)]
-pub use serial::{Config, Imu, Sample};
+pub use serial::{next_synced_frame, Config, Imu, Sample};

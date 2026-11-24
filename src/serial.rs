@@ -18,6 +18,9 @@ pub struct Config {
     /// Read with this syscall number instead of read(2): the M20's vendor kernel delivers its IMU UART only through
     /// one (aarch64 0x1cb on AOS); its tty path never sees the bytes.
     pub read_syscall: Option<libc::c_long>,
+    /// Read one frame of this length at a time as the M20's yesense_node does: 1-byte reads until 'Y', then 'S', then
+    /// the rest in one read, a 10 us sleep after each; None reads `read_chunk_bytes` into the stream decoder.
+    pub frame_sync: Option<usize>,
     pub decoder: DecoderConfig,
 }
 
@@ -28,6 +31,7 @@ impl Config {
             baud,
             read_chunk_bytes: 256,
             read_syscall: None,
+            frame_sync: None,
             decoder: DecoderConfig::default(),
         }
     }
@@ -46,6 +50,7 @@ pub struct Imu {
     decoder: Decoder,
     chunk: Vec<u8>,
     read_syscall: Option<libc::c_long>,
+    frame_sync: Option<usize>,
     last_read_time: SystemTime,
 }
 
@@ -62,12 +67,31 @@ impl Imu {
             decoder: Decoder::new(config.decoder),
             chunk: vec![0; config.read_chunk_bytes.max(1)],
             read_syscall: config.read_syscall,
+            frame_sync: config.frame_sync,
             last_read_time: SystemTime::now(),
         })
     }
 
     /// Blocks until a whole valid frame has arrived.
     pub fn next_sample(&mut self) -> io::Result<Sample> {
+        if let Some(length) = self.frame_sync {
+            let (file, number, decoder) = (&mut self.file, self.read_syscall, &mut self.decoder);
+            let mut read = |buffer: &mut [u8]| match number {
+                Some(n) => read_syscall_retrying(n, file, buffer),
+                None => read_retrying(file, buffer),
+            };
+            loop {
+                let frame = next_synced_frame(&mut read, length, decoder);
+                // yesense_node's timer_callback: nanosleep 10 us after each pass
+                std::thread::sleep(SYNC_PAUSE);
+                if let Some(frame) = frame? {
+                    return Ok(Sample {
+                        frame,
+                        host_time: SystemTime::now(),
+                    });
+                }
+            }
+        }
         loop {
             if let Some(frame) = self.decoder.next_frame() {
                 return Ok(Sample {
@@ -110,6 +134,47 @@ impl Iterator for Imu {
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.next_sample())
     }
+}
+
+/// yesense_node's pause after each frame (its timer_callback loop's nanosleep).
+const SYNC_PAUSE: std::time::Duration = std::time::Duration::from_micros(10);
+
+/// One pass of yesense_node's frame read (YESENSE_Publisher::timer_callback): 1-byte reads until 'Y', then 'S' (else
+/// back to 'Y'), then the rest of a `length`-byte frame in one read; that frame decoded alone. None for a short read
+/// or a frame that does not decode (the pass is dropped, as the vendor drops it).
+pub fn next_synced_frame(
+    read: &mut impl FnMut(&mut [u8]) -> io::Result<usize>,
+    length: usize,
+    decoder: &mut Decoder,
+) -> io::Result<Option<Frame>> {
+    let mut frame = vec![0u8; length.max(crate::protocol::MIN_FRAME_LEN)];
+    loop {
+        let mut byte = [0u8; 1];
+        loop {
+            if read(&mut byte)? != 1 {
+                return Ok(None);
+            }
+            if byte[0] == crate::protocol::HEADER[0] {
+                break;
+            }
+        }
+        if read(&mut byte)? != 1 {
+            return Ok(None);
+        }
+        if byte[0] == crate::protocol::HEADER[1] {
+            break;
+        }
+    }
+    frame[..2].copy_from_slice(&crate::protocol::HEADER);
+    let rest = frame.len() - 2;
+    if read(&mut frame[2..])? != rest {
+        return Ok(None);
+    }
+    decoder.clear();
+    decoder.push(&frame);
+    let decoded = decoder.next_frame();
+    decoder.clear();
+    Ok(decoded)
 }
 
 /// One read(2), retried on EINTR; end-of-file (the device went away) is an `UnexpectedEof` error.
